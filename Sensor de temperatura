@@ -1,0 +1,294 @@
+/************************************************************************************
+// Semáforo de temperatura con LM35, RGB, servo, 7 segmentos y Adafruit IO
+// ALUMNO(A): Daniela Contreras
+// CARNÉ:     21407
+// ELECTRONICA DIGITAL 2
+
+//************************************* */
+// Librerias 
+//************************************* */
+#include <Arduino.h>
+#include <stdint.h>
+#include <driver/ledc.h>
+#include "config.h"
+#include <AdafruitIO_Feed.h>
+#include "display7_4.h"
+
+
+// Adafruit IO
+AdafruitIO_Feed *canalTemperatura = io.feed("temperatura");  
+
+// para refrescar el display
+TaskHandle_t gDispTask = nullptr;
+void displayTask(void *);  
+
+
+inline void displayBlank(bool on) {
+  if (on) {
+    // Forzar TODOS los dígitos a APAGADO
+    digitalWrite(DIG1, LOW);
+    digitalWrite(DIG2, LOW);
+    digitalWrite(DIG3, LOW);
+  }
+  
+}
+
+
+void displayTask(void *){
+  const TickType_t period = pdMS_TO_TICKS(1);   // 1 ms por ciclo
+  TickType_t last = xTaskGetTickCount();
+  for(;;){
+    refreshDisplay7x3();                        // llamada de librería
+    vTaskDelayUntil(&last, period);
+  }
+}
+
+//************************************* */
+// Definiciones
+//************************************* */
+
+// Sensor y botón
+#define LM35_PIN 35
+#define ADC_RESOLUTION 4096.0
+#define ADC_VREF_mV 3300.0
+#define BTN_PIN 25        // Botón
+
+// LEDs 
+#define LED_R_PIN 15
+#define LED_G_PIN 2
+#define LED_B_PIN 4
+
+// PWM
+#define pwmChR 0
+#define pwmChG 1
+#define pwmChB 2
+
+// frecuencia PWM 
+#define freqPWM 5000
+
+// resolución PWM 
+#define resPWM 10
+
+// SERVO 
+#define SERVO_PIN   23          
+#define SERVO_CH    3
+#define SERVO_FREQ  50
+#define SERVO_RES   10
+
+// Pulsos
+const uint16_t SERVO_MAX_DUTY = (1 << SERVO_RES) - 1;  // 1023
+const uint16_t SERVO_1ms      = (uint16_t)(1000 * SERVO_MAX_DUTY / 20000UL);  // 51
+const uint16_t SERVO_1p5ms    = (uint16_t)(1500 * SERVO_MAX_DUTY / 20000UL);  // 77
+const uint16_t SERVO_2ms      = (uint16_t)(2000 * SERVO_MAX_DUTY / 20000UL);  // 102
+
+// Antirrebote
+const unsigned long DEBOUNCE_MS = 40;
+bool btnStableState = HIGH;           // con PULLUP, "no presionado" = HIGH
+bool btnLastRead    = HIGH;
+unsigned long lastBounceTime = 0;
+
+//************************************* */
+// Prototipos
+//************************************* */
+float readTempC_averaged(uint16_t N = 32);
+
+const bool LEDS_COMMON_ANODE = false;
+
+bool hasLatched = false;
+float latchedTempC = 0.0f;
+
+void servoInit(void);
+void servoWriteDuty(uint16_t duty);
+void servoWriteUS(uint16_t us);
+void servoWriteAngle(float angle);
+void updateServoFromTemp(float tempC);
+
+// utilidades
+const uint16_t MAX_DUTY = (1 << resPWM) - 1;
+void initPWM(void);
+inline void setRGB(uint16_t r, uint16_t g, uint16_t b) {
+  if (LEDS_COMMON_ANODE) {
+    r = MAX_DUTY - r;
+    g = MAX_DUTY - g;
+    b = MAX_DUTY - b;
+  }
+  ledcWrite(pwmChR, r);
+  ledcWrite(pwmChG, g);
+  ledcWrite(pwmChB, b);
+}
+
+
+void updateSemaforo(float tempC) {
+  // t < 22 -> Verde ; 22 <= t < 25 -> Amarillo ; t >= 25 -> Rojo
+  const uint16_t B = 0;
+  const uint16_t ON = MAX_DUTY;     
+  if (tempC < 22.0f) {
+    setRGB(0, ON, B);               // Verde
+  } else if (tempC < 25.0f) {
+    setRGB(ON, ON, B);              // Amarillo 
+  } else {
+    setRGB(ON, 0, B);               // Rojo
+  }
+}
+
+
+void setup() {
+  // put your setup code here, to run once:
+  Serial.begin(115200);
+  // Conexión a Adafruit IO
+  Serial.print("Conectando a Adafruit IO");
+  io.connect();
+  while (io.status() < AIO_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+  Serial.println(io.statusText());
+  // ADC ESP32
+  analogSetWidth(12);
+  analogSetAttenuation(ADC_11db); // 0–3.3 V
+  analogSetPinAttenuation(LM35_PIN, ADC_11db);
+  adcAttachPin(LM35_PIN);
+
+  for (int i = 0; i < 16; i++) { analogRead(LM35_PIN); delay(2); }
+
+  pinMode(BTN_PIN, INPUT_PULLUP);
+
+  Serial.println("Listo. Presiona el botón para tomar una lectura.");
+
+  // inicializar PWM (setup + attach + duty=0)
+  initPWM();
+
+  // apagar LEDs al inicio
+  setRGB(0, 0, 0);
+
+  configDisplay7x3();         // configurar pines del display
+  setTemperatureXX_X(0.0f);   // valor inicial opcional
+  xTaskCreatePinnedToCore(
+  displayTask,   // función
+  "dispMux",     // nombre
+  2048,          // stack
+  nullptr,       // parámetro
+  2,             // prioridad (baja-media)
+  &gDispTask,    // handle
+  0              // core (0 o 1; 0 va bien)
+);
+  servoInit();
+
+  
+
+}
+
+void loop() {
+  io.run();
+  // Antirrebote por muestreo
+  bool reading = digitalRead(BTN_PIN);
+  if (reading != btnLastRead) {
+    lastBounceTime = millis();
+  }
+  if ((millis() - lastBounceTime) > DEBOUNCE_MS) {
+    // Estado estable alcanzado
+    if (reading != btnStableState) {
+      btnStableState = reading;
+
+      // Flanco de bajada presión del botón
+      if (btnStableState == LOW) {
+
+        setRGB(0, 0, 0);                     // apaga RGB
+        if (gDispTask) vTaskSuspend(gDispTask); // PAUSA multiplexeo del display
+        displayBlank(true);                  // fuerza dígitos apagados
+        delay(6);                            // 4–8 ms bastan
+
+
+        float tempC = readTempC_averaged(32);
+
+        // Reactiva el display 
+        displayBlank(true);                  // permanece apagado hasta reanudar tarea
+        if (gDispTask) vTaskResume(gDispTask); // REANUDA multiplexeo
+
+        //LATCH guarda y muestra solo cuando se presiona 
+        latchedTempC = tempC;
+        hasLatched = true;
+
+        updateSemaforo(tempC);
+        setTemperatureXX_X(tempC);
+        updateServoFromTemp(tempC);
+
+        // Publicar a Adafruit IO
+        canalTemperatura->save(latchedTempC);
+
+        Serial.print("Temperatura: ");
+        Serial.print(tempC, 2);
+        Serial.println(" °C");
+
+
+      }
+    }
+  }
+  btnLastRead = reading;
+
+  
+}
+// Lee N muestras y promedia 
+float readTempC_averaged(uint16_t N) {
+  uint32_t acc = 0;
+  for (uint16_t i = 0; i < N; i++) {
+    acc += analogRead(LM35_PIN);
+    delayMicroseconds(250); // pequeño espaciamiento 
+  }
+  float avgCounts = (float)acc / (float)N;
+  float milliVolt = avgCounts * (ADC_VREF_mV / ADC_RESOLUTION); // mV
+  float tempC = (milliVolt / 10.0f)+ 10.0f; // LM35: 10 mV/°C
+  return tempC;
+}
+
+void initPWM(void){
+  // configurar frecuencia/resolución por canal
+  ledcSetup(pwmChR, freqPWM, resPWM);
+  ledcSetup(pwmChG, freqPWM, resPWM);
+  ledcSetup(pwmChB, freqPWM, resPWM);
+
+  // asociar pines a canales
+  ledcAttachPin(LED_R_PIN, pwmChR);
+  ledcAttachPin(LED_G_PIN, pwmChG);
+  ledcAttachPin(LED_B_PIN, pwmChB);
+
+  // duty inicial
+  ledcWrite(pwmChR, 0);
+  ledcWrite(pwmChG, 0);
+  ledcWrite(pwmChB, 0);
+}
+
+void servoInit(void){
+  ledcSetup(SERVO_CH, SERVO_FREQ, SERVO_RES);
+  ledcAttachPin(SERVO_PIN, SERVO_CH);
+  servoWriteDuty(SERVO_1ms);   // posición inicial 0°
+}
+
+void servoWriteDuty(uint16_t duty){
+  if (duty > SERVO_MAX_DUTY) duty = SERVO_MAX_DUTY;
+  ledcWrite(SERVO_CH, duty);
+}
+
+void servoWriteUS(uint16_t us){
+  // duty = us/20000 * 1023
+  uint16_t duty = (uint16_t)((uint32_t)us * SERVO_MAX_DUTY / 20000UL);
+  servoWriteDuty(duty);
+}
+
+void servoWriteAngle(float angle){
+  if (angle < 0) angle = 0;
+  if (angle > 180) angle = 180;
+  // interpola linealmente entre 1.0 ms (0°) y 2.0 ms (180°)
+  uint16_t us = 1000 + (uint16_t)((2000 - 1000) * (angle / 180.0f));
+  servoWriteUS(us);
+}
+
+// Mapea temperatura a 0..180° 
+void updateServoFromTemp(float tempC){
+  const float tMin = 15.0f, tMax = 35.0f;  
+  if (tempC < tMin) tempC = tMin;
+  if (tempC > tMax) tempC = tMax;
+  float angle = (tempC - tMin) * (180.0f / (tMax - tMin));
+  servoWriteAngle(angle);
+}
