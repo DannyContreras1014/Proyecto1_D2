@@ -25,7 +25,7 @@ void displayTask(void *);
 
 inline void displayBlank(bool on) {
   if (on) {
-    // Forzar TODOS los dígitos a APAGADO
+    // Apagar los digitos
     digitalWrite(DIG1, LOW);
     digitalWrite(DIG2, LOW);
     digitalWrite(DIG3, LOW);
